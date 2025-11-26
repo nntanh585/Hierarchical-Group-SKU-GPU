@@ -29,6 +29,7 @@ class HierarchicalHdbscanAssigner:
         self,
         embed_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
         min_cluster_size: int = 2,
+        batch_size=128,
         master_similarity_threshold: float = 0.85,
         variant_similarity_threshold: float = 0.95,
     ):
@@ -36,6 +37,7 @@ class HierarchicalHdbscanAssigner:
         self.embed_model_name = embed_model_name
         self.model: Optional[SentenceTransformer] = None
         self.min_cluster_size = min_cluster_size
+        self.batch_size = batch_size
         self.master_threshold = master_similarity_threshold
         self.variant_threshold = variant_similarity_threshold
 
@@ -55,7 +57,10 @@ class HierarchicalHdbscanAssigner:
         print("Model loaded.")
 
     # Initial Clustering Pipeline
-    def build_initial_clusters(self, json_file: str):
+    def build_initial_clusters(
+        self,
+        json_file: Optional[str] = None
+    ):
         """
         Perform a full offline bootstrap process:
           1. Load dataset from JSON
@@ -65,18 +70,22 @@ class HierarchicalHdbscanAssigner:
           5. For each master group, encode and cluster variants locally
         """
         print(f"--- Bootstrapping from {json_file} ---")
-        # Step 1: Load + Transform
+
+        # Step 1: Tranform data
         df = _transform_data_from_json(json_file)
-
-        # Step 2: Encode Master Embeddings
         print("Encoding master embeddings...")
-        master_texts = df.apply(_get_master_text, axis=1).tolist()
-        master_vecs = (
-            self.model.encode(master_texts, normalize_embeddings=True, show_progress_bar=True)
-            .astype("float32")
-        )
 
-        # Step 3: HDBSCAN Clustering
+        # Step 2: Encode texts
+        master_texts = df.apply(_get_master_text, axis=1).tolist()
+        with torch.inference_mode():
+            master_vecs = self.model.encode(
+                master_texts,
+                batch_size=self.batch_size,            
+                normalize_embeddings=True,
+                show_progress_bar=False               
+            ).astype("float32")
+
+        # Step 3: Use HDBSCAN to clustering 
         print("Running HDBSCAN for master clustering...")
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=self.min_cluster_size,
@@ -85,81 +94,64 @@ class HierarchicalHdbscanAssigner:
         )
         labels = clusterer.fit_predict(master_vecs)
 
-        # Assign outliers new incremental master IDs
+        # Assign outliers new IDs
         max_label = max(labels)
-        if max_label == -1:
-            max_label = 0
-
-        next_id = max_label + 1
-        final_master_ids = []
-
-        for label in labels:
-            if label != -1:
-                final_master_ids.append(label)
-            else:
-                final_master_ids.append(next_id)
-                next_id += 1
-
-        df["master_id"] = final_master_ids
+        next_id = (max_label if max_label != -1 else 0) + 1
+        df["master_id"] = [
+            label if label != -1 else (next_id := next_id + 1) - 1
+            for label in labels
+        ]
         self.next_master_id = next_id
 
         print(f"Total Master Groups Identified: {self.next_master_id}")
 
-        # Step 4: Build FAISS index
+        # Step 4: FAISS
         print("Building FAISS index for masters...")
         self.master_index = faiss.IndexFlatIP(master_vecs.shape[1])
         self.master_index.add(master_vecs)
 
-        # Step 5: Variant Clustering (Per-group)
+        #Step 5: VARIANTS
+        print("Encoding ALL variant vectors once...")
+        variant_texts_all = df.apply(_get_variant_text, axis=1).tolist()
+        with torch.inference_mode():
+            variant_vecs_all = self.model.encode(
+                variant_texts_all,
+                batch_size=self.batch_size,           
+                normalize_embeddings=True,
+                show_progress_bar=False              
+            ).astype("float32")
+
         print("Clustering variants group-by-group...")
-
         variant_id_map = {}
+        self.variant_store = {}
+        
         grouped = df.groupby("master_id")
-
         for m_id, group_df in grouped:
             self.variant_store[m_id] = []
 
-            # Encode variant-level text only for that group
-            variant_texts = group_df.apply(_get_variant_text, axis=1).tolist()
+            # get correct embedding slice
+            group_indices = group_df.index.tolist()
+            group_vecs = variant_vecs_all[group_indices]
 
-            variant_vecs = (
-                self.model.encode(
-                    variant_texts,
-                    normalize_embeddings=True,
-                    batch_size=64,
-                    show_progress_bar=False,
-                ).astype("float32")
-            )
+            for local_idx, (row_idx, vec) in enumerate(zip(group_indices, group_vecs)):
+                assigned = -1
 
-            # Local variant similarity clustering
-            for i, (row_idx, row) in enumerate(group_df.iterrows()):
-                v_text = variant_texts[i]
-                v_vec = variant_vecs[i]
+                for v in self.variant_store[m_id]:
+                    sim = float(np.dot(vec, v["vector"]))
+                    if sim >= self.variant_threshold:
+                        assigned = v["variant_id"]
+                        break
 
-                current_variants = self.variant_store[m_id]
-                assigned_id = -1
-                best_sim = -1.0
+                if assigned == -1:
+                    assigned = len(self.variant_store[m_id])
+                    self.variant_store[m_id].append({
+                        "variant_id": assigned,
+                        "vector": vec,
+                        "specs": variant_texts_all[row_idx],
+                        "original_sku": df.loc[row_idx, "seller_sku"]
+                    })
 
-                for v in current_variants:
-                    sim = float(np.dot(v_vec, v["vector"]))
-                    if sim > best_sim:
-                        best_sim = sim
-                        if sim >= self.variant_threshold:
-                            assigned_id = v["variant_id"]
-                            break
-
-                if assigned_id == -1:
-                    assigned_id = len(current_variants)
-                    self.variant_store[m_id].append(
-                        {
-                            "variant_id": assigned_id,
-                            "vector": v_vec,
-                            "specs": v_text,
-                            "original_sku": row.get("seller_sku"),
-                        }
-                    )
-
-                variant_id_map[row_idx] = assigned_id
+                variant_id_map[row_idx] = assigned
 
         df["variant_id"] = df.index.map(variant_id_map)
         self.df_master = df
