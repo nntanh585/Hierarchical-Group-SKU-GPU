@@ -1,7 +1,8 @@
 import psutil, os, gc, time
 from group_hierarchical import HierarchicalHdbscanAssigner
 from rakuten_processor_hierarchical import (
-    _transform_data_from_json
+    _transform_data_from_json,
+    _transform_data_from_dataframe
 )
 
 def measure_memory(func):
@@ -29,30 +30,23 @@ def measure_memory(func):
 HierarchicalHdbscanAssigner._load_model = measure_memory(HierarchicalHdbscanAssigner._load_model)
 HierarchicalHdbscanAssigner.build_initial_clusters = measure_memory(HierarchicalHdbscanAssigner.build_initial_clusters)
 
+embed_model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 assigner = HierarchicalHdbscanAssigner(
-    embed_model_name="sentence-transformers/all-MiniLM-L6-v2",
-    min_cluster_size=2,       
-    master_similarity_threshold=0.8, 
-    variant_similarity_threshold=0.999
+    embed_model_name=embed_model,
+    min_cluster_size=2,
+    master_similarity_threshold=0.85,
+    variant_similarity_threshold=0.95
 )
-
 json_filename = "./data.json"
 assigner.build_initial_clusters(json_filename)
 
-df = _transform_data_from_json("./sample.json")
-variant_score = 0.999
-for index, row in df.iterrows():
-    master_id, variant_id = assigner.assign_new_product(
-        product_dict=row,
-        variant_score=variant_score
-    )
-    print(master_id, variant_id)
-
-assigner.df_master[['product_id','product_name','category_name','seller_sku','attributes','jan_infor','master_id','variant_id']].sort_values(by=['master_id', 'variant_id']).to_csv("result.csv")
+#Save csv
+assigner.df_master.sort_values(by=['master_id', 'variant_id']).to_csv("./result_before_references.csv")
+_transform_data_from_dataframe(assigner.df_master).to_csv("./result_before.csv")
 
 # More Different
 df = _transform_data_from_json("./sample_more_different.json")
-variant_score = 0.993
+variant_score = 0.95
 for index, row in df.iterrows():
     master_id, variant_id = assigner.assign_new_product(
         product_dict=row,
@@ -60,5 +54,5 @@ for index, row in df.iterrows():
     )
     print(master_id, variant_id)
 
-assigner.df_master[['product_id','product_name','category_name','seller_sku','attributes','jan_infor','master_id','variant_id']].sort_values(by=['master_id', 'variant_id']).to_csv("result_moreDifferent.csv")
-
+assigner.df_master.sort_values(by=['master_id', 'variant_id']).to_csv("./result_after_references.csv")
+df_transform_before.to_csv("./result_after.csv")
